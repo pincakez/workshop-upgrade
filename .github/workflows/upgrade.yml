@@ -46,12 +46,18 @@ jobs:
           now_type=$(h "/servers/$SERVER_ID" | jq -r '.server.server_type.name')
           stock=$(h "/server_types?name=$TARGET" | jq -r --arg c "$CITY" '.server_types[0].locations[] | select(.name==$c) | .available')
           hour=$(TZ=Africa/Cairo date +%-H)
-          echo "server type now: $now_type · $TARGET in $CITY available: $stock · Cairo hour: $hour · dry run: $DRY" | tee -a "$GITHUB_STEP_SUMMARY"
+          # Yakot: «a R2 backup and an ADAM backup before that». The workshop itself runs both backups when
+          # cx53 is in stock and then stamps the server label `backups_ok=<unix time>`. No fresh stamp
+          # (younger than 3 h) = no upgrade.
+          stamp=$(h "/servers/$SERVER_ID" | jq -r '.server.labels.backups_ok // "0"')
+          age=$(( $(date +%s) - stamp ))
+          fresh=false; [ "$age" -ge 0 ] && [ "$age" -le 10800 ] && fresh=true
+          echo "server type now: $now_type · $TARGET in $CITY available: $stock · Cairo hour: $hour · backups stamp fresh: $fresh · dry run: $DRY" | tee -a "$GITHUB_STEP_SUMMARY"
           go=false
           if [ "$now_type" = "$TARGET" ]; then
             echo "Already $TARGET — nothing to do; disabling this workflow." | tee -a "$GITHUB_STEP_SUMMARY"
             echo "done=true" >> "$GITHUB_OUTPUT"
-          elif [ "$stock" = "true" ] && [ "$hour" -ge 2 ] && [ "$hour" -le 8 ]; then
+          elif [ "$stock" = "true" ] && [ "$fresh" = "true" ] && [ "$hour" -ge 2 ] && [ "$hour" -le 8 ]; then
             go=true
           fi
           [ "$DRY" = "true" ] && { echo "DRY RUN — would upgrade now: $go" | tee -a "$GITHUB_STEP_SUMMARY"; go=false; }
