@@ -1,0 +1,125 @@
+# ONE-TIME upgrade of the Gcademy workshop (Hetzner cx43 → cx53), Yakot's word 2026-11-05 (223rd session).
+# Every hour: is cx53 in stock in Nuremberg (nbg1)? If yes AND it is a quiet hour in Cairo (02:00–08:59):
+#   snapshot → gentle shutdown → change type «CPU and RAM only» (disk stays → going back stays possible) → power on
+#   → wait for the live site → disable this workflow so it can never run twice.
+# Whatever fails after the shutdown, the last step ALWAYS powers the server back on.
+name: workshop-upgrade
+
+on:
+  schedule:
+    - cron: "23 * * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Only check and print the plan (no snapshot, no shutdown)"
+        type: boolean
+        default: true
+
+permissions:
+  actions: write
+  contents: read
+
+concurrency:
+  group: workshop-upgrade
+  cancel-in-progress: false
+
+env:
+  SERVER_ID: "166625155"
+  TARGET: "cx53"
+  CITY: "nbg1"
+  API: "https://api.hetzner.cloud/v1"
+  SITE: "https://g.gates-tech.com/"
+
+jobs:
+  upgrade:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Decide
+        id: decide
+        env:
+          HCLOUD_TOKEN: ${{ secrets.HCLOUD_TOKEN }}
+          DRY: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || false }}
+        run: |
+          set -euo pipefail
+          h() { curl -fsS -H "Authorization: Bearer $HCLOUD_TOKEN" "$API$1"; }
+          now_type=$(h "/servers/$SERVER_ID" | jq -r '.server.server_type.name')
+          stock=$(h "/server_types?name=$TARGET" | jq -r --arg c "$CITY" '.server_types[0].locations[] | select(.name==$c) | .available')
+          hour=$(TZ=Africa/Cairo date +%-H)
+          echo "server type now: $now_type · $TARGET in $CITY available: $stock · Cairo hour: $hour · dry run: $DRY" | tee -a "$GITHUB_STEP_SUMMARY"
+          go=false
+          if [ "$now_type" = "$TARGET" ]; then
+            echo "Already $TARGET — nothing to do; disabling this workflow." | tee -a "$GITHUB_STEP_SUMMARY"
+            echo "done=true" >> "$GITHUB_OUTPUT"
+          elif [ "$stock" = "true" ] && [ "$hour" -ge 2 ] && [ "$hour" -le 8 ]; then
+            go=true
+          fi
+          [ "$DRY" = "true" ] && { echo "DRY RUN — would upgrade now: $go" | tee -a "$GITHUB_STEP_SUMMARY"; go=false; }
+          echo "go=$go" >> "$GITHUB_OUTPUT"
+
+      - name: Upgrade (snapshot → shutdown → change type → power on)
+        if: steps.decide.outputs.go == 'true'
+        env:
+          HCLOUD_TOKEN: ${{ secrets.HCLOUD_TOKEN }}
+        run: |
+          set -euo pipefail
+          h()  { curl -fsS -H "Authorization: Bearer $HCLOUD_TOKEN" "$API$1"; }
+          hp() { local body="${2:-}"; [ -z "$body" ] && body='{}'; curl -fsS -X POST -H "Authorization: Bearer $HCLOUD_TOKEN" -H "Content-Type: application/json" -d "$body" "$API$1"; }
+          wait_action() {  # $1 = action id, $2 = max seconds
+            for i in $(seq 1 $(( $2 / 5 ))); do
+              st=$(h "/actions/$1" | jq -r '.action.status')
+              [ "$st" = "success" ] && return 0
+              [ "$st" = "error" ] && { h "/actions/$1" | jq -c '.action.error'; return 1; }
+              sleep 5
+            done
+            echo "action $1 timed out"; return 1
+          }
+          status() { h "/servers/$SERVER_ID" | jq -r '.server.status'; }
+
+          echo "1/4 snapshot (server still running)"
+          a=$(hp "/servers/$SERVER_ID/actions/create_image" '{"type":"snapshot","description":"before-cx53-upgrade","labels":{"why":"workshop-upgrade"}}' | jq -r '.action.id')
+          wait_action "$a" 1800
+
+          echo "2/4 gentle shutdown"
+          hp "/servers/$SERVER_ID/actions/shutdown" >/dev/null
+          for i in $(seq 1 36); do [ "$(status)" = "off" ] && break; sleep 5; done
+          if [ "$(status)" != "off" ]; then
+            echo "still running after 3 min → hard power-off"
+            a=$(hp "/servers/$SERVER_ID/actions/poweroff" | jq -r '.action.id'); wait_action "$a" 300
+          fi
+
+          echo "3/4 change type to $TARGET (CPU and RAM only)"
+          a=$(hp "/servers/$SERVER_ID/actions/change_type" "{\"server_type\":\"$TARGET\",\"upgrade_disk\":false}" | jq -r '.action.id')
+          wait_action "$a" 1200
+          echo "type change done" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: ALWAYS power the server back on
+        if: always() && steps.decide.outputs.go == 'true'
+        env:
+          HCLOUD_TOKEN: ${{ secrets.HCLOUD_TOKEN }}
+        run: |
+          set -uo pipefail
+          h()  { curl -fsS -H "Authorization: Bearer $HCLOUD_TOKEN" "$API$1"; }
+          for try in 1 2 3; do
+            st=$(h "/servers/$SERVER_ID" | jq -r '.server.status')
+            echo "status: $st"
+            [ "$st" = "running" ] && break
+            [ "$st" = "off" ] && curl -fsS -X POST -H "Authorization: Bearer $HCLOUD_TOKEN" "$API/servers/$SERVER_ID/actions/poweron" >/dev/null
+            sleep 30
+          done
+          echo "4/4 waiting for the live site"
+          for i in $(seq 1 60); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "$SITE" || true)
+            [ "$code" = "200" ] && { echo "site answers 200 after ~$((i*10)) s" | tee -a "$GITHUB_STEP_SUMMARY"; break; }
+            sleep 10
+          done
+          echo "final type: $(h "/servers/$SERVER_ID" | jq -r '.server.server_type.name') · status: $(h "/servers/$SERVER_ID" | jq -r '.server.status')" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Disable this workflow (one time only)
+        if: steps.decide.outputs.done == 'true' || (success() && steps.decide.outputs.go == 'true')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          curl -fsS -X PUT -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/workflows/upgrade.yml/disable"
+          echo "workflow disabled" | tee -a "$GITHUB_STEP_SUMMARY"
